@@ -1,0 +1,18 @@
+# macOS Finder metadata
+.DS_Store
+
+# Python bytecode & packaging artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+*.whl
+*.tar.gz

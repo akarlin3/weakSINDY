@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+title: "weakSINDY: Weak-Form Sparse Identification of Integer- and Fractional-Order Nonlinear Dynamical Systems and PDEs"
+message: "If you use weakSINDY in your research, please cite the software archive and the accompanying Chaos (AIP Publishing) manuscript below."
+type: software
+authors:
+  - family-names: "Karlin"
+    given-names: "Avery"
+    email: "ak5232@columbia.edu"
+    orcid: "https://orcid.org/0000-0003-3848-6782"
+    affiliation: "Department of Applied Physics and Applied Mathematics, Columbia University; Department of Computer Science, University of Colorado Boulder"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.20637003"
+    description: "Zenodo software archive for v1.0.0"
+doi: "10.5281/zenodo.20637003"
+repository-code: "https://github.com/akarlin3/weakSINDY"
+url: "https://github.com/akarlin3/weakSINDY"
+license: MIT
+version: "1.0.0"
+date-released: "2026-11-10"
+keywords:
+  - SINDy
+  - weak-form sparse regression
+  - fractional calculus
+  - Grunwald-Letnikov derivative
+  - PDE discovery
+  - noise amplification
+  - Lyapunov exponents
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Karlin"
+      given-names: "Avery"
+      email: "ak5232@columbia.edu"
+      orcid: "https://orcid.org/0000-0003-3848-6782"
+      affiliation: "Department of Applied Physics and Applied Mathematics, Columbia University; Department of Computer Science, University of Colorado Boulder"
+  title: "Identifiability, noise fragility, and weak-form mitigation of fractional sparse regression in a vascular–stromal reaction–diffusion model, with cautions on data-driven Lyapunov estimation"
+  journal: "Chaos: An Interdisciplinary Journal of Nonlinear Science"
+  publisher:
+    name: "AIP Publishing"
+  year: 2026
+  doi: "10.5281/zenodo.20637003"
