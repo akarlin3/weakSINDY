@@ -1,8 +1,10 @@
 # weakSINDY
 
+[![CI](https://github.com/akarlin3/weakSINDY/actions/workflows/ci.yml/badge.svg)](https://github.com/akarlin3/weakSINDY/actions/workflows/ci.yml)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20637003.svg)](https://doi.org/10.5281/zenodo.20637003)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
+[![Typed: PEP 561](https://img.shields.io/badge/typing-PEP%20561-informational.svg)](src/weaksindy/py.typed)
 
 **Weak-form sparse identification of integer- and fractional-order nonlinear dynamical systems and PDEs under high measurement noise.**
 
@@ -12,6 +14,14 @@
 
 ## Installation
 
+Install directly from GitHub:
+
+```bash
+pip install git+https://github.com/akarlin3/weakSINDY.git
+```
+
+Or install from PyPI:
+
 ```bash
 pip install weak-sindy
 ```
@@ -19,6 +29,8 @@ pip install weak-sindy
 To install with the command-line interface (`weaksindy`):
 
 ```bash
+pip install "weak-sindy[cli] @ git+https://github.com/akarlin3/weakSINDY.git"
+# or via PyPI:
 pip install "weak-sindy[cli]"
 ```
 
