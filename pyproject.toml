@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "weak-sindy"
-version = "1.1.0"
-description = "General-purpose N-dimensional weak-form fractional PDE discovery, continuous order optimization, and conformal ensemble uncertainty quantification"
+version = "1.2.0"
+description = "General-purpose N-dimensional weak-form fractional PDE discovery, exogenous control (weakSINDYc), multi-order fractional operators, sklearn integration, and conformal ensemble UQ"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -15,6 +15,7 @@ authors = [
 ]
 keywords = [
     "SINDy",
+    "weakSINDYc",
     "weak-form",
     "fractional-calculus",
     "Grunwald-Letnikov",
@@ -39,15 +40,18 @@ classifiers = [
 dependencies = [
     "numpy>=1.22.0",
     "scipy>=1.8.0",
-    "scikit-learn>=1.2.0",
 ]
 
 [project.optional-dependencies]
+sklearn = [
+    "scikit-learn>=1.2.0",
+]
 cli = [
     "click>=8.0.0",
 ]
 dev = [
     "click>=8.0.0",
+    "scikit-learn>=1.2.0",
     "pytest>=7.0.0",
     "build>=1.0.0",
     "twine>=4.0.0",

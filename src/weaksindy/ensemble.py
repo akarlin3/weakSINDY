@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any, Literal, Sequence
 
 import numpy as np
-from sklearn.base import BaseEstimator
 
+from ._sklearn_compat import BaseEstimator
 from .library import BaseCandidateLibrary
 from .operators import extract_time_step
 from .solvers import SR3, STLSQ, WeakSINDy, _compute_aic_bic, _mean_r2_score

@@ -9,8 +9,8 @@ from typing import Callable, Literal, Sequence
 
 import numpy as np
 from scipy.ndimage import convolve1d
-from sklearn.base import BaseEstimator, TransformerMixin
 
+from ._sklearn_compat import BaseEstimator, TransformerMixin
 from .operators import (
     extract_spatial_steps,
     extract_time_step,

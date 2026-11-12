@@ -359,6 +359,44 @@ bio_lib = CombinedLibrary([
 ])
 ```
 
+### Example 4: Exogenous Control (`WeakSINDyControl`), Multi-Order Operators & `scikit-learn` `GridSearchCV` (`v1.2.0`)
+
+```python
+import numpy as np
+from weaksindy import (
+    MultiOrderWeakSINDy,
+    SklearnWeakSINDyRegressor,
+    WeakSINDyControl,
+    generate_controlled_fractional_system,
+    integrate_multi_order_ode,
+)
+
+# 1. Exogenous pulsed radiotherapy / PK control discovery (bilinear x_i u_j interactions)
+ctrl_bench = generate_controlled_fractional_system(alpha=0.80, snr_db=32.0, seed=20260613)
+ctrl_model = WeakSINDyControl(threshold=0.04, optimize_order=True, order_bounds=(0.4, 1.0))
+ctrl_model.fit(
+    ctrl_bench.t, ctrl_bench.X, ctrl_bench.U,
+    state_names=["x1", "x2"], control_names=["u_rad", "u_drug"],
+)
+ctrl_model.print()
+
+# 2. Vector-valued incommensurate multi-order discovery: alpha = (0.65, 0.90)
+t_mo = np.linspace(0.0, 18.0, 721)
+X_mo = integrate_multi_order_ode(
+    lambda y: np.array([-0.5 * y[0] + 1.1 * y[1], -1.1 * y[0] - 0.2 * y[1]]),
+    y0=[1.0, 0.2],
+    t=t_mo,
+    alphas=(0.65, 0.90),
+)
+mo_model = MultiOrderWeakSINDy(threshold=0.05).fit(t_mo, X_mo, input_features=["x", "y"])
+print("Recovered vector orders:", np.round(mo_model.orders_, 3))
+
+# 3. Drop-in scikit-learn GridSearchCV compatibility
+reg = SklearnWeakSINDyRegressor(dt=float(t_mo[1] - t_mo[0]), degree=2, threshold=0.05)
+reg.fit(X_mo)
+print("Trajectory weak-form R^2:", round(reg.score(X_mo), 4))
+```
+
 ---
 
 ## Public API Reference
@@ -366,6 +404,9 @@ bio_lib = CombinedLibrary([
 | Symbol | Module | Description |
 | :--- | :--- | :--- |
 | `WeakSINDy` | `weaksindy.solvers` | Weak-form / fractional SINDy estimator supporting discrete `orders=[...]` and continuous bounded Brent refinement (`optimize_order=True`, `order_profile_`, `aic_`, `bic_`). |
+| `WeakSINDyControl`, `weakSINDYc`, `ControlLibrary`, `generate_controlled_fractional_system` | `weaksindy.control` | Exogenous control/dosing weak-form discovery $D_t^\alpha \mathbf{x} = \Theta(\mathbf{x}, \nabla\mathbf{x}, \mathbf{u})\Xi$ with bilinear $x_i u_j$ terms and pulsed radiotherapy/PK benchmark. |
+| `MultiOrderWeakSINDy`, `multi_order_fractional_derivative`, `integrate_multi_order_ode` | `weaksindy.multi_order` | Vector-valued per-state $\boldsymbol{\alpha} \in (0, 1]^d$ and two-scale $D_t^{\alpha_1} + c D_t^{\alpha_2}$ fractional operators with coordinate/`L-BFGS-B` refinement. |
+| `SklearnWeakSINDyRegressor` | `weaksindy.sklearn_adapter` | Strict `scikit-learn` `BaseEstimator`/`RegressorMixin` adapter compatible with `GridSearchCV` and `Pipeline` (zero required core `sklearn` dependency). |
 | `EnsembleWeakSINDy` | `weaksindy.ensemble` | Subdomain-bagging & library-subsampling ensemble exposing `inclusion_probabilities_`, `coef_median_`, `coef_std_`, and split-conformal intervals `coef_ci(alpha=0.05)`. |
 | `fractional_derivative_gl`, `fractional_laplacian` | `weaksindy.operators` | Vectorized causal Grünwald–Letnikov derivative $\mathcal{D}^\alpha$ and symmetric Riesz / spectral fractional Laplacian $(-\Delta)^{\beta/2}$ in 1D–3D. |
 | `project_weak_form`, `contract_tensor_weak` | `weaksindy.test_functions` | Separable N-D tensor-product $C^p$ weak-form integration by parts for temporal fractional and spatial integer/fractional PDE operators. |

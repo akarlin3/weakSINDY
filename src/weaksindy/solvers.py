@@ -7,8 +7,8 @@ from typing import Literal, Sequence
 
 import numpy as np
 from scipy.optimize import minimize_scalar
-from sklearn.base import BaseEstimator, RegressorMixin
 
+from ._sklearn_compat import BaseEstimator, RegressorMixin
 from .library import BaseCandidateLibrary, PDELibrary, PolynomialLibrary
 from .operators import extract_spatial_steps, extract_time_step, fractional_derivative_gl
 from .test_functions import (
