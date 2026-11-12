@@ -12,6 +12,19 @@
 
 ---
 
+## AveryCorp Scientific Suites Architecture
+
+`weakSINDY` (`weak-sindy`) serves as the **Dynamical & Fractional PDE Identifiability Gate** in **Suite II** of AveryCorp's two-suite scientific software ecosystem, where all six libraries share the standardized zero-dependency `AuditReport` JSON diagnostic contract (`weaksindy --audit --json`):
+
+- **Suite I: Clinical Quantitative-MRI Trust Spine (`Diagnose -> Calibrate -> Benchmark`)**
+  - [`sextantIVIM`](https://github.com/akarlin3/sextantIVIM) (Stage 1: Boundary-Railing & Fisher CRLB) -> [`conformalIVIM`](https://github.com/akarlin3/conformalIVIM) (Stage 2: Finite-Sample Conformal Calibration & Drift/OOD Gate) -> [`IVIMBench`](https://github.com/akarlin3/IVIMBench) (Stage 3: Canonical DROs, Clean-Room Rulers & Closed-Loop RT).
+- **Suite II: Scientific Identifiability & Null-Audit Suite**
+  - **[`weakSINDY`](https://github.com/akarlin3/weakSINDY) (*This Repository*)**: Weak-form integer/fractional PDE/ODE discovery, exogenous control (`weakSINDYc`), multi-order operators, and conformal ensemble inclusion gating.
+  - [`chimeraAnneal`](https://github.com/akarlin3/chimeraAnneal): Metastable coupled-oscillator survival, graze-vs-absorbing collapse separation, and Weibull finite-size hazard scaling.
+  - [`proteusMine`](https://github.com/akarlin3/proteusMine): Structure-first catalytic triad geometry screening, `pLDDT` confound stratification, and Two One-Sided Tests (TOST) non-superiority auditing.
+
+---
+
 ## Installation
 
 Install directly from GitHub:

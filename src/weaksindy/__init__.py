@@ -1,5 +1,6 @@
 """weakSINDY: Noise-robust N-D weak-form fractional PDE discovery, exogenous control, multi-order operators, and conformal ensemble UQ."""
 
+from .audit import AuditReport, run_audit
 from .benchmarks import (
     BenchmarkDataset,
     simulate_fractional_lorenz,
@@ -64,6 +65,8 @@ __version__ = "1.2.0"
 
 __all__ = [
     "__version__",
+    "AuditReport",
+    "run_audit",
     "WeakSINDy",
     "WeakSINDyControl",
     "weakSINDYc",

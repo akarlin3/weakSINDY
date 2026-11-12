@@ -9,6 +9,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .audit import run_audit
 from .ensemble import EnsembleWeakSINDy
 from .library import PDELibrary, PolynomialLibrary
 from .solvers import WeakSINDy
@@ -190,7 +191,30 @@ def _render_markdown_report(payload: dict[str, Any]) -> str:
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
-@click.argument("input_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument(
+    "input_path",
+    required=False,
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--audit",
+    is_flag=True,
+    help="Run standardized AveryCorp Suite II weak-form identifiability audit and exit.",
+)
+@click.option(
+    "--json",
+    "json_flag",
+    is_flag=True,
+    help="Emit machine-readable JSON output (for --audit or standard discovery).",
+)
+@click.option(
+    "--seed",
+    type=int,
+    default=42,
+    show_default=True,
+    help="Deterministic PCG64 seed used with --audit.",
+)
 @click.option("--dt", type=float, default=None, help="Uniform time step dt (overrides time column).")
 @click.option("--dx", type=float, default=None, help="Spatial step size dx for N-D PDE datasets.")
 @click.option(
@@ -277,7 +301,10 @@ def _render_markdown_report(payload: dict[str, Any]) -> str:
 )
 @click.option("-q", "--quiet", is_flag=True, help="Suppress console summary banner.")
 def main(
-    input_path: Path,
+    input_path: Path | None,
+    audit: bool,
+    json_flag: bool,
+    seed: int,
     dt: float | None,
     dx: float | None,
     orders: str,
@@ -300,6 +327,22 @@ def main(
     quiet: bool,
 ) -> None:
     """Discover integer- or fractional-order ODEs and N-D PDEs from CSV/NumPy time-series."""
+    if audit:
+        rep = run_audit(seed=seed)
+        if json_flag or report_format.lower() == "json":
+            click.echo(rep.to_json(indent=2))
+        elif not quiet:
+            click.echo(rep.summary_line())
+            for k, v in rep.metrics.items():
+                click.echo(f"  - {k}: {v}")
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(rep.to_json(indent=2) + "\n", encoding="utf-8")
+        return
+
+    if input_path is None:
+        raise click.UsageError("Missing argument 'INPUT_PATH'.")
+
     t_val, X, eff_dx, var_names = _load_timeseries(input_path, dt_override=dt, dx_override=dx)
     cand_orders: Sequence[float] = _parse_orders(orders)
     bounds = _parse_bounds(order_bounds)
