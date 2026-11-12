@@ -6,9 +6,9 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 [![Typed: PEP 561](https://img.shields.io/badge/typing-PEP%20561-informational.svg)](src/weaksindy/py.typed)
 
-**Weak-form sparse identification of integer- and fractional-order nonlinear dynamical systems and PDEs under high measurement noise.**
+**General-purpose N-dimensional weak-form sparse identification of integer- and fractional-order ODEs and PDEs with continuous order refinement and conformal ensemble uncertainty quantification.**
 
-`weakSINDY` (`weak-sindy`, imported as `weaksindy`) is a standalone Python library for discovering sparse governing ordinary and partial differential equations—jointly with unknown Grünwald–Letnikov fractional differentiation orders $\alpha \in (0, 1]$—from noisy time-series and spatiotemporal measurements. By transferring causal fractional operators $\mathcal{D}_t^\alpha$ onto compactly supported $C^p$ polynomial test functions via discrete fractional summation by parts, `weakSINDY` eliminates the $\Delta t^{-2\alpha}$ high-frequency noise blow-up of pointwise fractional SINDy, collapsing breakdown thresholds by **15–25 dB** (oracle ceiling) and **15–30 dB** (deployment-realistic noisy validation). It also provides a continuous variational **Benettin QR tangent-space integrator** for arbitrating asymptotic stability versus chaos without delay-embedding transient artifacts.
+`weakSINDY` (`weak-sindy`, imported as `weaksindy`) is a standalone Python library for discovering sparse governing ordinary and partial differential equations—jointly with unknown Grünwald–Letnikov fractional differentiation orders $\alpha \in (0, 1]$—from noisy time-series and 1D/2D/3D spatiotemporal fields. By transferring both causal temporal fractional operators $\mathcal{D}_t^\alpha$ and spatial integer/fractional differential operators ($\nabla$, $\nabla^2$, $\nabla^4$, $\mathbf{u}\cdot\nabla$, and Riesz fractional diffusion $(-\Delta)^{\beta/2}$) onto separable compactly supported $C^p$ test functions $\Phi(t, \mathbf{x}) = \phi_t(t)\prod_{d=1}^D \phi_{x_d}(x_d)$, `weakSINDY` eliminates pointwise finite-difference and $\Delta t^{-2\alpha}$ noise blow-up, collapsing breakdown thresholds by **15–25 dB** (oracle ceiling) and **15–30 dB** (deployment-realistic noisy validation). Version `1.1.0` adds bounded continuous Brent/Pareto AIC/BIC order optimization, **`EnsembleWeakSINDy`** subdomain bagging with split-conformal confidence intervals, canonical fractional benchmarks, and a continuous variational **Benettin QR tangent-space integrator**.
 
 ---
 
@@ -47,6 +47,8 @@ pytest
 
 ## Quickstart
 
+### 1. Continuous Fractional Order Discovery (`WeakSINDy`)
+
 ```python
 import numpy as np
 from weaksindy import (
@@ -55,17 +57,17 @@ from weaksindy import (
     integrate_fractional_ode,
 )
 
-# 1. Simulate a fractional Van der Pol oscillator (true order alpha = 0.7)
+# 1. Simulate a fractional Van der Pol oscillator (true order alpha = 0.73)
 mu = 2.0
 t = np.linspace(0.0, 20.0, 800)
 X = integrate_fractional_ode(
     lambda s: np.array([s[1], mu * (1.0 - s[0] ** 2) * s[1] - s[0]]),
     y0=[0.5, 0.5],
     t=t,
-    alpha=0.7,
+    alpha=0.73,
 )
 
-# 2. Fit WeakSINDy across candidate fractional orders
+# 2. Pinpoint continuous fractional order alpha to ~1e-3 via bounded Brent + Pareto BIC
 model = WeakSINDy(
     library=PolynomialLibrary(degree=3),
     threshold=0.1,
@@ -75,26 +77,60 @@ model = WeakSINDy(
 model.fit(
     t,
     X,
-    orders=[0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+    optimize_order=True,
+    order_bounds=(0.2, 1.0),
     input_features=["x", "y"],
 )
 
-print(f"Recovered fractional order: {model.order_:.2f} (R^2 = {model.r2_score_:.4f})")
+print(f"Recovered fractional order: {model.order_:.4f} (BIC = {model.bic_:.2f}, R^2 = {model.r2_score_:.4f})")
 model.print()
-# D_t^0.70 x = 1.0000 y
-# D_t^0.70 y = -1.0000 x + 2.0000 y - 2.0000 x^2 y
+# D_t^0.730 x = 1.0000 y
+# D_t^0.730 y = -1.0000 x + 2.0000 y - 2.0000 x^2 y
 
 # 3. Predict fractional derivatives on new state trajectories
 dX_pred = model.predict(t, X)
 ```
 
+### 2. Uncertainty Quantification & Conformal Ensemble (`EnsembleWeakSINDy`)
+
+```python
+import numpy as np
+from weaksindy import (
+    EnsembleWeakSINDy,
+    PDELibrary,
+    simulate_subdiffusive_fisher_kpp_1d,
+)
+
+# Simulate noisy 1D subdiffusive Fisher–KPP reaction–diffusion PDE (22 dB SNR, alpha = 0.7)
+t = np.linspace(0.0, 3.5, 211)
+x = np.linspace(0.0, 10.0, 56)
+bench = simulate_subdiffusive_fisher_kpp_1d(t, x, alpha=0.7, D=0.12, r=1.0, snr_db=22.0)
+
+ensemble = EnsembleWeakSINDy(
+    library=PDELibrary(dx=bench.dx, poly_degree=2, derivative_orders=(1, 2), include_bias=False, boundary="neumann"),
+    threshold=0.04,
+    n_models=50,
+    subsample_fraction=0.7,
+    replace=True,
+    aggregate="median",
+    window_size=36,
+    spatial_window_size=16,
+)
+ensemble.fit(t, bench.X, optimize_order=True, order_bounds=(0.3, 1.0), input_features=["u"])
+
+ci_low, ci_high = ensemble.coef_ci(alpha=0.05)  # 95% out-of-bag split-conformal intervals
+print("Inclusion probabilities:", dict(zip(ensemble.feature_names_, np.round(ensemble.inclusion_probabilities_[0], 3))))
+ensemble.print()
+```
+
 ### Command-Line Interface
 
-Run discovery directly on `.csv`, `.npy`, or `.npz` trajectories:
+Run discovery and conformal ensemble UQ directly on `.csv`, `.npy`, or `.npz` trajectories:
 
 ```bash
 weaksindy trajectory.csv --orders 0.3,0.5,0.7,0.9,1.0 --degree 3 --threshold 0.05 -o report.json
-weaksindy fields_3d.npz --dx 0.2 --orders 0.5,0.7,0.9,1.0 --solver sr3
+weaksindy trajectory.csv --ensemble --n-models 50 --optimize-order --order-bounds 0.2,1.0 -o uq_report.md
+weaksindy fields_3d.npz --dx 0.2 --ensemble --n-models 50 --solver sr3 -o pde_report.json
 ```
 
 ---
@@ -283,18 +319,60 @@ lyap = compute_benettin_lyapunov(pde_rhs, y0, n_exponents=1, t_trans=20.0, t_run
 print(f"Benettin largest Lyapunov exponent: {lyap.lambda_max:.6f}")  # ~ -0.0734 (< 0, stable)
 ```
 
+### Example 3: N-Dimensional Spatiotemporal Tensor PDEs & Custom/Rational Bases
+
+```python
+import numpy as np
+from weaksindy import CombinedLibrary, CustomLibrary, PDELibrary, RationalLibrary, WeakSINDy
+
+# 2D spatiotemporal field U of shape (N_t, N_x, N_y, 1) with separable C^p tensor weak IBP
+nt, nx, ny = 121, 32, 32
+t = np.linspace(0.0, 2.0, nt)
+x = np.linspace(0.0, 2.0 * np.pi, nx, endpoint=False)
+dx = float(x[1] - x[0])
+T_g, X_g, Y_g = np.meshgrid(t, x, x, indexing="ij")
+U = (np.exp(-0.30 * T_g) * np.sin(X_g) * np.cos(Y_g))[..., np.newaxis]
+
+pde_2d = PDELibrary(
+    dx=(dx, dx),
+    poly_degree=2,
+    derivative_orders=(),
+    include_laplacian=True,
+    include_biharmonic=True,
+    riesz_orders=(1.5,),
+    include_bias=False,
+)
+model_2d = WeakSINDy(
+    library=pde_2d,
+    threshold=0.02,
+    window_size=30,
+    spatial_window_size=(12, 12),
+    spatial_stride=(4, 4),
+)
+model_2d.fit(t, U, orders=1.0, input_features=["u"])
+model_2d.print()  # D_t u = 0.1500 laplacian(u)
+
+# Combine arbitrary user-defined nonlinearities and Hill/Michaelis-Menten rational bases
+bio_lib = CombinedLibrary([
+    RationalLibrary(numerator_degree=1, denominator_degree=2, half_saturation=1.0),
+    CustomLibrary(functions=[lambda u: np.sin(u)], function_names=[lambda s: f"sin({s})"]),
+])
+```
+
 ---
 
 ## Public API Reference
 
 | Symbol | Module | Description |
 | :--- | :--- | :--- |
-| `WeakSINDy` | `weaksindy.solvers` | High-level weak-form / fractional SINDy estimator with `.fit(t, X, orders=...)`, `.predict(t, X)`, `.score(t, X)`, and `.equations()`. |
-| `fractional_derivative_gl` | `weaksindy.operators` | Vectorized causal Grünwald–Letnikov fractional derivative $\mathcal{D}^\alpha$ along any array axis (Toeplitz + FFT convolution). |
-| `project_weak_form` | `weaksindy.test_functions` | Projects state trajectories and candidate libraries onto $C^p$ compactly supported test functions via fractional summation by parts. |
+| `WeakSINDy` | `weaksindy.solvers` | Weak-form / fractional SINDy estimator supporting discrete `orders=[...]` and continuous bounded Brent refinement (`optimize_order=True`, `order_profile_`, `aic_`, `bic_`). |
+| `EnsembleWeakSINDy` | `weaksindy.ensemble` | Subdomain-bagging & library-subsampling ensemble exposing `inclusion_probabilities_`, `coef_median_`, `coef_std_`, and split-conformal intervals `coef_ci(alpha=0.05)`. |
+| `fractional_derivative_gl`, `fractional_laplacian` | `weaksindy.operators` | Vectorized causal Grünwald–Letnikov derivative $\mathcal{D}^\alpha$ and symmetric Riesz / spectral fractional Laplacian $(-\Delta)^{\beta/2}$ in 1D–3D. |
+| `project_weak_form`, `contract_tensor_weak` | `weaksindy.test_functions` | Separable N-D tensor-product $C^p$ weak-form integration by parts for temporal fractional and spatial integer/fractional PDE operators. |
+| `PDELibrary`, `PolynomialLibrary`, `FourierLibrary`, `RationalLibrary`, `CustomLibrary`, `CombinedLibrary` | `weaksindy.library` | Composable candidate libraries for ODEs, biochemical Hill/Michaelis–Menten kinetics, custom nonlinearities, and 1D/2D/3D fractional PDEs. |
+| `simulate_fractional_lorenz`, `simulate_subdiffusive_fisher_kpp_1d`, `simulate_vascular_stromal_rd` | `weaksindy.benchmarks` | Canonical fractional ODE and reaction–diffusion PDE synthetic data generators with exact symbolic ground-truth metadata (`BenchmarkDataset`). |
 | `compute_benettin_lyapunov` | `weaksindy.lyapunov` | Continuous RK4 variational QR integrator for leading $k$ tangent-space Lyapunov exponents (Jacobian-free or analytical Jacobian). |
 | `STLSQ`, `SR3` | `weaksindy.solvers` | Sequentially Thresholded Least Squares and Sparse Relaxed Regularized Regression ($\ell_0$ / $\ell_1$) solvers. |
-| `PolynomialLibrary`, `FourierLibrary`, `PDELibrary`, `CombinedLibrary` | `weaksindy.library` | Composable candidate basis libraries for ODEs and spatial reaction–diffusion PDEs. |
 | `noise_amplification_factor`, `weak_noise_amplification_factor` | `weaksindy.operators`, `weaksindy.test_functions` | Analytical white-noise variance amplification metrics $A(\alpha)$ and $A_{\text{weak}}(\alpha)$. |
 
 ---

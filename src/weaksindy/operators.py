@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Literal, Sequence
 
 import numpy as np
 from scipy.linalg import toeplitz
 from scipy.signal import fftconvolve
+from scipy.special import gammaln
 
 ArrayLike = np.ndarray | list[float] | tuple[float, ...]
 
@@ -29,6 +30,40 @@ def extract_time_step(t: float | int | np.ndarray) -> float:
     if not np.allclose(diffs, dt, rtol=1e-4, atol=1e-10):
         raise ValueError("Grünwald–Letnikov discretization requires a uniformly spaced grid.")
     return dt
+
+
+def extract_spatial_steps(
+    dx: float | int | np.ndarray | Sequence[float | int | np.ndarray],
+    n_dims: int,
+) -> tuple[float, ...]:
+    """Extract uniform spatial grid spacings ``(dx_1, ..., dx_D)`` across ``n_dims`` axes."""
+    if n_dims < 1:
+        raise ValueError(f"n_dims must be >= 1; got {n_dims}.")
+    if np.ndim(dx) == 0:
+        step = extract_time_step(float(dx))  # type: ignore[arg-type]
+        return (step,) * n_dims
+
+    if n_dims == 1:
+        if isinstance(dx, (list, tuple)) and len(dx) == 1:
+            return (extract_time_step(dx[0]),)
+        return (extract_time_step(np.asarray(dx, dtype=float)),)
+
+    if isinstance(dx, np.ndarray) and dx.ndim == 1 and dx.size == n_dims:
+        return tuple(extract_time_step(float(v)) for v in dx)
+
+    if isinstance(dx, (list, tuple)) and len(dx) == n_dims:
+        steps: list[float] = []
+        for item in dx:
+            if np.ndim(item) == 0:
+                steps.append(extract_time_step(float(item)))  # type: ignore[arg-type]
+            else:
+                steps.append(extract_time_step(np.asarray(item, dtype=float)))
+        return tuple(steps)
+
+    raise ValueError(
+        f"Cannot resolve {n_dims} spatial step sizes from dx specification of type {type(dx).__name__}."
+    )
+
 
 
 def gl_weights(alpha: float, n: int) -> np.ndarray:
@@ -239,3 +274,115 @@ def integrate_fractional_ode(
         y[k] = yk
 
     return y
+
+
+def riesz_weights(beta: float, n: int) -> np.ndarray:
+    """Compute symmetric centered Riesz–Grünwald fractional weights ``g_k^(beta)`` (Ortigueira, 2006).
+
+    Evaluates ``g_k^(beta) = (-1)^k Gamma(beta + 1) / [Gamma(beta/2 - k + 1) Gamma(beta/2 + k + 1)]``
+    for ``k = 0, ..., n - 1`` via exact pole-free recurrence. At ``beta = 2``, recovers the
+    classical three-point second-difference stencil ``[2, -1, 0, ...]`` for ``-d^2/dx^2``.
+    """
+    if n < 1:
+        raise ValueError(f"Number of weights n must be >= 1; got {n}.")
+    beta_f = float(beta)
+    if not np.isfinite(beta_f) or beta_f < 0.0:
+        raise ValueError(f"Riesz fractional order beta must be finite and >= 0; got {beta}.")
+
+    g = np.empty(n, dtype=np.float64)
+    g[0] = float(np.exp(gammaln(beta_f + 1.0) - 2.0 * gammaln(0.5 * beta_f + 1.0)))
+    if n > 1:
+        k = np.arange(1, n, dtype=np.float64)
+        factors = (k - 1.0 - 0.5 * beta_f) / (k + 0.5 * beta_f)
+        g[1:] = g[0] * np.cumprod(factors)
+    return g
+
+
+def riesz_operator_matrix(beta: float, n: int, dx: float = 1.0) -> np.ndarray:
+    """Construct the symmetric Toeplitz Riesz–Grünwald fractional diffusion matrix ``(-d^2/dx^2)^(beta/2)``."""
+    step = extract_time_step(dx)
+    g = riesz_weights(beta, n)
+    return toeplitz(g, g) / (step ** float(beta))
+
+
+def fractional_laplacian(
+    X: np.ndarray,
+    dx: float | np.ndarray | Sequence[float | np.ndarray] = 1.0,
+    beta: float = 1.5,
+    spatial_axes: Sequence[int] | None = None,
+    method: Literal["riesz", "spectral"] = "riesz",
+    toeplitz_cutoff: int = 4096,
+) -> np.ndarray:
+    """Evaluate spatial fractional diffusion ``(-Delta)^(beta/2) X`` across arbitrary spatial axes.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Field array, e.g. ``(nt, nx, n_vars)``, ``(nt, nx, ny, n_vars)``, or ``(nt, nx, ny, nz, n_vars)``.
+    dx : float or sequence of float/1D arrays, default=1.0
+        Uniform spatial grid step(s) along ``spatial_axes``.
+    beta : float, default=1.5
+        Spatial fractional order ``beta >= 0`` (``beta = 2`` corresponds to ``-Delta``).
+    spatial_axes : sequence of int or None, default=None
+        Axes treated as spatial coordinates. Defaults to ``range(1, X.ndim - 1)`` when
+        ``X.ndim >= 3``, else ``(0,)``.
+    method : {"riesz", "spectral"}, default="riesz"
+        ``"riesz"`` sums symmetric centered Riesz–Grünwald Toeplitz operators along each
+        spatial axis; ``"spectral"`` applies the periodic isotropic symbol ``||k||_2^beta``.
+    toeplitz_cutoff : int, default=4096
+        Grid size threshold above which FFT Toeplitz convolution replaces dense matmul.
+    """
+    arr = np.asarray(X, dtype=np.float64)
+    if arr.ndim == 0:
+        raise ValueError("Input X must be at least 1-dimensional.")
+    beta_f = float(beta)
+    if not np.isfinite(beta_f) or beta_f < 0.0:
+        raise ValueError(f"Spatial fractional order beta must be finite and >= 0; got {beta}.")
+    if beta_f == 0.0:
+        return arr.copy()
+
+    if spatial_axes is None:
+        axes = tuple(range(1, arr.ndim - 1)) if arr.ndim >= 3 else (0,)
+    else:
+        axes = tuple(int(a) % arr.ndim for a in spatial_axes)
+    if len(axes) == 0:
+        raise ValueError("At least one spatial axis must be specified for fractional_laplacian.")
+
+    steps = extract_spatial_steps(dx, len(axes))
+
+    if method == "spectral":
+        k_sq = np.zeros([arr.shape[a] for a in axes], dtype=np.float64)
+        for idx, (ax, step) in enumerate(zip(axes, steps)):
+            n_ax = arr.shape[ax]
+            freqs = 2.0 * np.pi * np.fft.fftfreq(n_ax, d=step)
+            shape = [1] * len(axes)
+            shape[idx] = n_ax
+            k_sq = k_sq + (freqs.reshape(shape) ** 2)
+        symbol = k_sq ** (0.5 * beta_f)
+        expand_shape = [1] * arr.ndim
+        for idx, ax in enumerate(axes):
+            expand_shape[ax] = arr.shape[ax]
+        spec = np.fft.fftn(arr, axes=axes)
+        return np.fft.ifftn(spec * symbol.reshape(expand_shape), axes=axes).real
+
+    if method != "riesz":
+        raise ValueError(f"method must be 'riesz' or 'spectral'; got {method!r}.")
+
+    total = np.zeros_like(arr)
+    for ax, step in zip(axes, steps):
+        moved = np.moveaxis(arr, ax, 0)
+        n_ax = moved.shape[0]
+        rest = moved.shape[1:]
+        flat = moved.reshape(n_ax, -1)
+        g = riesz_weights(beta_f, n_ax)
+        scale = step**beta_f
+        if n_ax <= toeplitz_cutoff:
+            R = toeplitz(g, g)
+            part_flat = (R @ flat) / scale
+        else:
+            kernel = np.concatenate([g[:0:-1], g])[:, np.newaxis]
+            conv = fftconvolve(flat, kernel, mode="full", axes=0)[n_ax - 1 : 2 * n_ax - 1]
+            part_flat = conv / scale
+        total += np.moveaxis(part_flat.reshape((n_ax, *rest)), 0, ax)
+    return total
+

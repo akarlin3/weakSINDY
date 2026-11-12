@@ -1,15 +1,25 @@
-"""Sparse regression solvers (STLSQ, SR3) and high-level WeakSINDy estimator."""
+"""Sparse regression solvers (STLSQ, SR3) and WeakSINDy with continuous order optimization."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, Sequence
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 from sklearn.base import BaseEstimator, RegressorMixin
 
 from .library import BaseCandidateLibrary, PDELibrary, PolynomialLibrary
-from .operators import extract_time_step, fractional_derivative_gl
-from .test_functions import generate_windows, project_weak_form
+from .operators import extract_spatial_steps, extract_time_step, fractional_derivative_gl
+from .test_functions import (
+    build_spatial_weak_weights,
+    build_weak_weights,
+    bump_test_function,
+    contract_tensor_weak,
+    generate_windows,
+    project_weak_form,
+    resolve_spatial_windows,
+)
 
 
 def _mean_r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -25,36 +35,108 @@ def _mean_r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.mean(r2_per_var))
 
 
+def _compute_aic_bic(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    n_active: int,
+    *,
+    noise_gain: float | None = None,
+    state_vars: np.ndarray | None = None,
+    n_indep: float | None = None,
+    eps_floor: float = 1e-16,
+) -> tuple[float, float]:
+    """Compute adjoint-whitened Pareto AIC and BIC across multi-output targets."""
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    if yt.ndim == 1:
+        yt = yt[:, np.newaxis]
+        yp = yp[:, np.newaxis]
+    n_samples, n_vars = yt.shape
+    n_eff = float(max(4.0, n_indep)) if n_indep is not None else float(max(1, n_samples * n_vars))
+
+    if noise_gain is not None and state_vars is not None:
+        mse_per_var = np.mean((yt - yp) ** 2, axis=0)
+        rel_var = float(np.mean(mse_per_var / (max(noise_gain, 1e-30) * state_vars)))
+        loss_metric = max(rel_var, eps_floor)
+    else:
+        ss_res = np.sum((yt - yp) ** 2, axis=0)
+        ss_tot = np.sum((yt - np.mean(yt, axis=0, keepdims=True)) ** 2, axis=0)
+        loss_metric = max(float(np.mean(ss_res / (ss_tot + 1e-12))), eps_floor)
+
+    k = int(n_active)
+    aic = float(n_eff * np.log(loss_metric) + 2.0 * k)
+    bic = float(n_eff * np.log(loss_metric) + np.log(n_eff) * k)
+    return aic, bic
+
+
+@dataclass
+class _ProjectedSystemCache:
+    """Pre-contracted spatial/feature weak projection cache for O(1) alpha sweeps."""
+
+    use_weak: bool
+    X_design: np.ndarray
+    X_source: np.ndarray
+    dt: float
+    k_start: int
+    k_end: int
+    windows: list[tuple[int, int]] | None = None
+    phi_t: np.ndarray | None = None
+    X_spatial: np.ndarray | None = None
+    spatial_noise_gain: float = 1.0
+    overlap_factor: float = 1.0
+
+    def target_and_gain(self, alpha: float) -> tuple[np.ndarray, float]:
+        n_vars = self.X_source.shape[-1]
+        if not self.use_weak:
+            X_dot = fractional_derivative_gl(self.X_source, t=self.dt, alpha=alpha, axis=0)
+            y_out = X_dot[self.k_start : self.k_end].reshape(-1, n_vars)
+            return y_out, float(self.dt ** (-2.0 * float(alpha)))
+
+        assert self.windows is not None and self.phi_t is not None
+        _, Psi_t = build_weak_weights(
+            n_steps=self.X_source.shape[0],
+            windows=self.windows,
+            alpha=alpha,
+            phi=self.phi_t,
+            dt=self.dt,
+        )
+        t_gain = float(np.mean(np.sum(Psi_t * Psi_t, axis=0)))
+        total_gain = max(t_gain * float(self.spatial_noise_gain), 1e-30)
+        if self.X_spatial is not None:
+            proj = np.tensordot(Psi_t, self.X_spatial, axes=([0], [0]))
+            return proj.reshape(-1, n_vars), total_gain
+        if self.X_source.ndim == 2:
+            return Psi_t.T @ self.X_source, total_gain
+        proj = np.moveaxis(np.tensordot(self.X_source, Psi_t, axes=([0], [0])), -1, 0)
+        return proj.reshape(-1, n_vars), total_gain
+
+    def target(self, alpha: float) -> np.ndarray:
+        y_out, _ = self.target_and_gain(alpha)
+        return y_out
+
+
+def _ridge_solve(X_sub: np.ndarray, Y_sub: np.ndarray, alpha: float) -> np.ndarray:
+    """Solve ``argmin_B ||Y_sub - X_sub @ B||_F^2 + alpha ||B||_F^2`` via SVD without squaring ``cond(X)``."""
+    reg = float(alpha)
+    if reg <= 0.0:
+        B, *_ = np.linalg.lstsq(X_sub, Y_sub, rcond=None)
+        return B
+    U, s, Vt = np.linalg.svd(X_sub, full_matrices=False)
+    filt = s / (s * s + reg)
+    return (Vt.T * filt) @ (U.T @ Y_sub)
+
+
 class STLSQ(BaseEstimator, RegressorMixin):
     """Sequentially Thresholded Least Squares (STLSQ) sparse regression solver.
 
     Solves ``argmin_Xi ||Y - X @ Xi.T||_F^2 + alpha ||Xi||_F^2`` with iterative
     hard thresholding on coefficient entries below ``threshold``.
-
-    Parameters
-    ----------
-    threshold : float, default=0.01
-        Sparsity hard-thresholding cutoff.
-    alpha : float, default=1e-4
-        Tikhonov / ridge regularization penalty ``eta_ridge >= 0`` for ill-conditioned
-        candidate Gram matrices.
-    max_iter : int, default=20
-        Maximum number of sequential thresholding + debiasing iterations.
-    normalize_columns : bool, default=True
-        Normalize columns of ``X`` to unit l2 norm prior to normal-equation solves.
-    threshold_scaled : bool, default=False
-        If ``False`` (default), applies ``|Xi_{d,j}| < threshold`` in physical units
-        after rescaling by column norms. If ``True``, applies thresholding directly
-        on column-norm-scaled regression weights.
-    unbias : bool, default=True
-        Perform a final unpenalized (or ridge-stabilized) least-squares polish on the
-        converged active support.
     """
 
     def __init__(
         self,
         threshold: float = 0.01,
-        alpha: float = 1e-4,
+        alpha: float = 1e-12,
         max_iter: int = 20,
         normalize_columns: bool = True,
         threshold_scaled: bool = False,
@@ -89,14 +171,11 @@ class STLSQ(BaseEstimator, RegressorMixin):
             norms = np.ones(n_features, dtype=np.float64)
             X_work = X_arr
 
-        XtX = X_work.T @ X_work
-        Xty_all = X_work.T @ Y_arr
-        reg_eye = float(self.alpha) * np.eye(n_features, dtype=np.float64)
-        base_beta = np.linalg.solve(XtX + reg_eye, Xty_all)
+        base_beta = _ridge_solve(X_work, Y_arr, float(self.alpha))
 
         coefs = np.zeros((n_targets, n_features), dtype=np.float64)
         for d in range(n_targets):
-            Xty = Xty_all[:, d]
+            y_d = Y_arr[:, d]
             beta = base_beta[:, d].copy()
             active = np.ones(n_features, dtype=bool)
 
@@ -109,13 +188,7 @@ class STLSQ(BaseEstimator, RegressorMixin):
                     active = new_active
                     break
 
-                X_sub = XtX[np.ix_(new_active, new_active)]
-                Xty_sub = Xty[new_active]
-                k_act = int(np.sum(new_active))
-                beta_sub = np.linalg.solve(
-                    X_sub + float(self.alpha) * np.eye(k_act, dtype=np.float64),
-                    Xty_sub,
-                )
+                beta_sub = _ridge_solve(X_work[:, new_active], y_d, float(self.alpha))
                 beta_new = np.zeros(n_features, dtype=np.float64)
                 beta_new[new_active] = beta_sub
 
@@ -129,9 +202,23 @@ class STLSQ(BaseEstimator, RegressorMixin):
             if self.unbias and np.any(active):
                 X_act = X_arr[:, active]
                 coef_act, *_ = np.linalg.lstsq(X_act, Y_arr[:, d], rcond=None)
-                # Fall back to ridge-regularized estimate if active columns are nearly singular
                 if np.all(np.isfinite(coef_act)):
-                    coefs[d, active] = coef_act
+                    if not self.threshold_scaled:
+                        small = np.abs(coef_act) < float(self.threshold)
+                        if np.any(small):
+                            coef_act[small] = 0.0
+                            coefs[d, active] = coef_act
+                            still_active = coefs[d] != 0.0
+                            if np.any(still_active):
+                                coef_act2, *_ = np.linalg.lstsq(
+                                    X_arr[:, still_active], Y_arr[:, d], rcond=None
+                                )
+                                if np.all(np.isfinite(coef_act2)):
+                                    coefs[d, still_active] = coef_act2
+                        else:
+                            coefs[d, active] = coef_act
+                    else:
+                        coefs[d, active] = coef_act
                 else:
                     coefs[d] = beta / norms
             else:
@@ -150,35 +237,7 @@ class STLSQ(BaseEstimator, RegressorMixin):
 
 
 class SR3(BaseEstimator, RegressorMixin):
-    """Sparse Relaxed Regularized Regression (SR3) solver.
-
-    Minimizes the relaxed splitting objective (Zheng et al., 2019; Champion et al., 2020):
-
-    .. math::
-
-        \\min_{\\Xi, W} \\frac{1}{2} \\|Y - X \\Xi^\\top\\|_F^2
-        + \\frac{1}{2\\nu} \\|\\Xi - W\\|_F^2 + \\lambda R(W)
-
-    via alternating least-squares and proximal hard (``l0``) or soft (``l1``) thresholding,
-    followed by an active-support debiasing polish.
-
-    Parameters
-    ----------
-    threshold : float, default=0.05
-        Proximal thresholding cutoff ``tau`` applied to auxiliary weights ``W``.
-    nu : float, default=1.0
-        Relaxation coupling parameter ``nu > 0`` controlling ``||Xi - W||_F^2 / (2 nu)``.
-    reg_type : {"l0", "l1"}, default="l0"
-        Regularizer family: ``"l0"`` for hard thresholding or ``"l1"`` for soft thresholding.
-    max_iter : int, default=100
-        Maximum alternating minimization iterations.
-    tol : float, default=1e-6
-        Relative convergence tolerance on auxiliary sparse weights ``W``.
-    normalize_columns : bool, default=True
-        Normalize columns of ``X`` during the alternating solve for conditioning.
-    unbias : bool, default=True
-        Refit least squares restricted to the converged nonzero support of ``W``.
-    """
+    """Sparse Relaxed Regularized Regression (SR3) solver."""
 
     def __init__(
         self,
@@ -238,7 +297,6 @@ class SR3(BaseEstimator, RegressorMixin):
         Xty = X_work.T @ Y_arr
         lhs = XtX + np.diag(inv_nu_vec)
 
-        # Warm-start auxiliary sparse weights W from weakly regularized ridge estimate
         Xi_init = np.linalg.solve(XtX + 1e-5 * np.eye(n_features, dtype=np.float64), Xty)
         W_T = self._prox(Xi_init, tau_vec)
 
@@ -251,14 +309,13 @@ class SR3(BaseEstimator, RegressorMixin):
                 break
             W_T = W_T_new
 
-        coefs = (W_T / norms[:, np.newaxis]).T  # (n_targets, n_features)
+        coefs = (W_T / norms[:, np.newaxis]).T
         if self.unbias:
             for d in range(n_targets):
                 active = coefs[d] != 0.0
                 if np.any(active):
                     coef_act, *_ = np.linalg.lstsq(X_arr[:, active], Y_arr[:, d], rcond=None)
                     if np.all(np.isfinite(coef_act)):
-                        # Re-prune any terms that dropped below threshold after debiasing
                         small = np.abs(coef_act) < float(self.threshold)
                         coef_act[small] = 0.0
                         coefs[d] = 0.0
@@ -283,47 +340,12 @@ class SR3(BaseEstimator, RegressorMixin):
 
 
 class WeakSINDy(BaseEstimator):
-    """Weak-form sparse identification of integer- and fractional-order dynamics and PDEs.
+    """Weak-form sparse identification of integer- and fractional-order dynamics and N-D PDEs.
 
-    Transfers the causal Grünwald–Letnikov fractional operator ``D_t^alpha`` onto
-    compactly supported ``C^p`` polynomial test functions to suppress the high-frequency
-    pointwise variance amplification ``A(alpha) = dt^(-2 alpha) ||w^(alpha)||_2^2``.
-    Supports joint recovery of unknown fractional temporal orders ``alpha in (0, 1]``
-    and sparse nonlinear ODE/PDE governing equations.
-
-    Parameters
-    ----------
-    library : BaseCandidateLibrary or None, default=None
-        Candidate feature library. Defaults to ``PolynomialLibrary(degree=3)`` for 2D ODE
-        trajectories or ``PDELibrary(dx=dx, poly_degree=2)`` for 3D spatiotemporal fields.
-    optimizer : {"stlsq", "sr3"} or STLSQ or SR3, default="stlsq"
-        Sparse regression solver or solver name.
-    threshold : float, default=0.01
-        Sparsity threshold passed when instantiating the default ``optimizer``.
-    alpha_reg : float, default=1e-4
-        Ridge penalty (for ``STLSQ``) or relaxation parameter ``nu`` when custom solver
-        is not explicitly supplied.
-    orders : float or sequence of float, default=(1.0,)
-        Default candidate fractional differentiation orders ``alpha`` if not passed to ``fit``.
-    use_weak : bool, default=True
-        If ``True``, uses weak-form ``C^p`` test-function projection. If ``False``, uses
-        pointwise Grünwald–Letnikov differentiation (useful for baseline benchmarking).
-    window_size : int, default=50
-        Weak-form window width ``H`` in time steps.
-    stride : int, default=5
-        Stride ``S`` between adjacent weak-form integration windows.
-    test_degree : int, default=4
-        Smoothness exponent ``p`` of the ``C^p`` bump kernel ``(1 - xi^2)^p``.
-    k_start : int, default=20
-        Initial time steps discarded from regression to avoid ``t = 0`` GL startup transients.
-    val_split : float, default=0.2
-        Fraction of terminal time steps reserved for held-out ``R^2`` order selection when
-        sweeping multiple candidate ``orders``.
-    dx : float or None, default=None
-        Default spatial grid spacing ``dx`` for 3D PDE inputs when ``library=None``.
-    refit : bool, default=True
-        After selecting ``order_`` on the validation split, refit sparse coefficients across
-        the full post-transient trajectory ``[k_start, nt)``.
+    Transfers causal Grünwald–Letnikov fractional temporal derivatives ``D_t^alpha`` and
+    spatial PDE operators onto separable compactly supported ``C^p`` test functions.
+    Supports both discrete fractional-order candidate sweeps and continuous bounded
+    Brent refinement (``optimize_order=True``) via Pareto AIC/BIC model selection.
     """
 
     def __init__(
@@ -331,15 +353,20 @@ class WeakSINDy(BaseEstimator):
         library: BaseCandidateLibrary | None = None,
         optimizer: Literal["stlsq", "sr3"] | STLSQ | SR3 = "stlsq",
         threshold: float = 0.01,
-        alpha_reg: float = 1e-4,
+        alpha_reg: float = 1e-12,
         orders: float | Sequence[float] = (1.0,),
+        optimize_order: bool = False,
+        order_bounds: tuple[float, float] = (0.1, 1.0),
+        criterion: Literal["bic", "aic"] = "bic",
         use_weak: bool = True,
         window_size: int = 50,
         stride: int = 5,
+        spatial_window_size: int | Sequence[int] | None = None,
+        spatial_stride: int | Sequence[int] | None = None,
         test_degree: int = 4,
         k_start: int = 20,
         val_split: float = 0.2,
-        dx: float | None = None,
+        dx: float | np.ndarray | Sequence[float | np.ndarray] | None = None,
         refit: bool = True,
     ) -> None:
         self.library = library
@@ -347,9 +374,14 @@ class WeakSINDy(BaseEstimator):
         self.threshold = threshold
         self.alpha_reg = alpha_reg
         self.orders = orders
+        self.optimize_order = optimize_order
+        self.order_bounds = order_bounds
+        self.criterion = criterion
         self.use_weak = use_weak
         self.window_size = window_size
         self.stride = stride
+        self.spatial_window_size = spatial_window_size
+        self.spatial_stride = spatial_stride
         self.test_degree = test_degree
         self.k_start = k_start
         self.val_split = val_split
@@ -371,13 +403,19 @@ class WeakSINDy(BaseEstimator):
             return SR3(threshold=self.threshold)
         raise ValueError(f"Unsupported optimizer {self.optimizer!r}; expected 'stlsq' or 'sr3'.")
 
-    def _make_library(self, X: np.ndarray, dx: float | None) -> BaseCandidateLibrary:
+    def _make_library(
+        self,
+        X: np.ndarray,
+        dx: float | np.ndarray | Sequence[float | np.ndarray] | None,
+    ) -> BaseCandidateLibrary:
         if self.library is not None:
             return self.library
-        if X.ndim == 3:
+        if X.ndim >= 3:
             eff_dx = dx if dx is not None else self.dx
             if eff_dx is None:
-                raise ValueError("3D PDE input requires dx (pass dx=... or supply a PDELibrary).")
+                raise ValueError(
+                    "Spatiotemporal PDE input (ndim >= 3) requires dx (pass dx=... or supply a PDELibrary)."
+                )
             return PDELibrary(dx=eff_dx, poly_degree=2, include_interaction=False)
         return PolynomialLibrary(degree=3, include_bias=True, include_interaction=True)
 
@@ -389,17 +427,158 @@ class WeakSINDy(BaseEstimator):
             S = max(1, min(S, H // 4))
         return H, S
 
+    def _build_cache(
+        self,
+        X_src: np.ndarray,
+        lib: BaseCandidateLibrary,
+        dt: float,
+        k_start: int,
+        k_end: int,
+        dx: float | np.ndarray | Sequence[float | np.ndarray] | None = None,
+    ) -> _ProjectedSystemCache:
+        eff_dx = dx if dx is not None else self.dx
+        if not self.use_weak:
+            Theta_eval = lib.transform(X_src)
+            X_des = Theta_eval[k_start:k_end].reshape(-1, Theta_eval.shape[-1])
+            return _ProjectedSystemCache(
+                use_weak=False,
+                X_design=X_des,
+                X_source=X_src,
+                dt=dt,
+                k_start=k_start,
+                k_end=k_end,
+            )
+
+        H, S = self._resolve_window_params(k_end - k_start)
+        wins = generate_windows(
+            n_steps=X_src.shape[0],
+            window_size=H,
+            stride=S,
+            k_start=k_start,
+            k_end=k_end,
+        )
+        phi_t = bump_test_function(window_size=H, degree=self.test_degree, dt=dt, normalize=True)
+        Phi_t, _ = build_weak_weights(
+            n_steps=X_src.shape[0],
+            windows=wins,
+            alpha=0.0,
+            phi=phi_t,
+            dt=dt,
+        )
+
+        spatial_ndim = X_src.ndim - 2
+        use_spatiotemporal = spatial_ndim >= 1 and (
+            getattr(lib, "_supports_spatiotemporal_weak", False)
+            or eff_dx is not None
+            or self.spatial_window_size is not None
+        )
+
+        if use_spatiotemporal:
+            sp_shape = X_src.shape[1:-1]
+            sp_wins = resolve_spatial_windows(
+                sp_shape,
+                spatial_window_size=self.spatial_window_size,
+                spatial_stride=self.spatial_stride,
+            )
+            if eff_dx is not None:
+                sp_steps = extract_spatial_steps(eff_dx, spatial_ndim)
+            elif hasattr(lib, "_get_spatial_steps"):
+                sp_steps = lib._get_spatial_steps(spatial_ndim)
+            else:
+                sp_steps = (1.0,) * spatial_ndim
+
+            Phi_x0 = [
+                build_spatial_weak_weights(
+                    n_grid=sp_shape[d],
+                    windows=sp_wins[d],
+                    dx=sp_steps[d],
+                    degree=self.test_degree,
+                    diff_order=0,
+                )
+                for d in range(spatial_ndim)
+            ]
+
+            if hasattr(lib, "_project_spatiotemporal_weak"):
+                X_des = lib._project_spatiotemporal_weak(
+                    X_src,
+                    Phi_t=Phi_t,
+                    Phi_x0=Phi_x0,
+                    sp_wins=sp_wins,
+                    sp_steps=sp_steps,
+                    sp_degree=self.test_degree,
+                )
+            else:
+                Theta_eval = lib.transform(X_src)
+                X_des = contract_tensor_weak(Theta_eval, [Phi_t, *Phi_x0])
+
+            # Pre-contract X_src along spatial axes 1..D so temporal Psi_t(alpha) applies in O(nt * M_sp)
+            curr_sp = X_src
+            for d in range(spatial_ndim):
+                c = np.tensordot(curr_sp, Phi_x0[d], axes=([1 + d], [0]))
+                curr_sp = np.moveaxis(c, -1, 1 + d)
+            X_sp = curr_sp.reshape(X_src.shape[0], -1, X_src.shape[-1])
+
+            sp_gain = float(
+                np.prod([float(np.mean(np.sum(w * w, axis=0))) for w in Phi_x0])
+            )
+            sp_overlap = 1.0
+            for d_idx, wins_d in enumerate(sp_wins):
+                if len(wins_d) >= 2:
+                    h_d = max(1, wins_d[0][1] - wins_d[0][0])
+                    s_d = max(1, wins_d[1][0] - wins_d[0][0])
+                    sp_overlap *= max(1.0, h_d / s_d)
+                else:
+                    sp_overlap *= 1.0
+            t_overlap = max(1.0, H / max(1, S)) if len(wins) >= 2 else 1.0
+
+            return _ProjectedSystemCache(
+                use_weak=True,
+                X_design=X_des,
+                X_source=X_src,
+                dt=dt,
+                k_start=k_start,
+                k_end=k_end,
+                windows=wins,
+                phi_t=phi_t,
+                X_spatial=X_sp,
+                spatial_noise_gain=sp_gain,
+                overlap_factor=t_overlap * sp_overlap,
+            )
+
+        Theta_eval = lib.transform(X_src)
+        if X_src.ndim == 2:
+            X_des = Phi_t.T @ Theta_eval
+        else:
+            t_proj = np.moveaxis(np.tensordot(Theta_eval, Phi_t, axes=([0], [0])), -1, 0)
+            X_des = t_proj.reshape(-1, Theta_eval.shape[-1])
+
+        t_overlap = max(1.0, H / max(1, S)) if len(wins) >= 2 else 1.0
+        return _ProjectedSystemCache(
+            use_weak=True,
+            X_design=X_des,
+            X_source=X_src,
+            dt=dt,
+            k_start=k_start,
+            k_end=k_end,
+            windows=wins,
+            phi_t=phi_t,
+            X_spatial=None,
+            spatial_noise_gain=1.0,
+            overlap_factor=t_overlap,
+        )
+
     def _assemble_system(
         self,
         X: np.ndarray,
-        Theta: np.ndarray,
+        Theta: np.ndarray | None,
         dt: float,
         alpha: float,
         k_start: int,
         k_end: int,
+        library: BaseCandidateLibrary | None = None,
+        dx: float | np.ndarray | Sequence[float | np.ndarray] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        n_feat = Theta.shape[-1]
-        n_vars = X.shape[-1]
+        eff_dx = dx if dx is not None else self.dx
         if self.use_weak:
             H, S = self._resolve_window_params(k_end - k_start)
             wins = generate_windows(
@@ -414,13 +593,19 @@ class WeakSINDy(BaseEstimator):
                 Theta=Theta,
                 t=dt,
                 alpha=alpha,
+                dx=eff_dx,
+                library=library,
                 degree=self.test_degree,
+                spatial_window_size=self.spatial_window_size,
+                spatial_stride=self.spatial_stride,
                 windows=wins,
             )
 
+        Theta_arr = library.transform(X) if (Theta is None and library is not None) else Theta
+        assert Theta_arr is not None
         X_dot = fractional_derivative_gl(X, t=dt, alpha=alpha, axis=0)
-        Theta_slice = Theta[k_start:k_end].reshape(-1, n_feat)
-        Y_slice = X_dot[k_start:k_end].reshape(-1, n_vars)
+        Theta_slice = Theta_arr[k_start:k_end].reshape(-1, Theta_arr.shape[-1])
+        Y_slice = X_dot[k_start:k_end].reshape(-1, X.shape[-1])
         return Theta_slice, Y_slice
 
     def fit(
@@ -429,12 +614,15 @@ class WeakSINDy(BaseEstimator):
         X: np.ndarray,
         orders: float | Sequence[float] | None = None,
         *,
-        dx: float | None = None,
+        optimize_order: bool | None = None,
+        order_bounds: tuple[float, float] | None = None,
+        criterion: Literal["bic", "aic"] | None = None,
+        dx: float | np.ndarray | Sequence[float | np.ndarray] | None = None,
         X_clean: np.ndarray | None = None,
         true_order: float | None = None,
         input_features: Sequence[str] | None = None,
     ) -> WeakSINDy:
-        """Fit sparse governing equations and select fractional order ``order_``.
+        """Fit sparse governing equations and identify discrete or continuous fractional order.
 
         Parameters
         ----------
@@ -442,31 +630,33 @@ class WeakSINDy(BaseEstimator):
             Uniform time step ``dt`` or 1D time coordinate array of length ``nt``.
         X : np.ndarray
             Observed state trajectory of shape ``(nt, n_vars)`` (ODE) or
-            ``(nt, nx, n_vars)`` (1D spatial PDE).
+            ``(nt, *spatial_dims, n_vars)`` (1D, 2D, or 3D spatial PDE).
         orders : float or sequence of float or None, default=None
-            Candidate fractional temporal orders ``alpha`` to evaluate. Defaults to
-            ``self.orders``.
-        dx : float or None, default=None
-            Optional spatial step size for 3D PDE data when ``self.library is None``.
+            Discrete candidate fractional temporal orders ``alpha``.
+        optimize_order : bool or None, default=None
+            If ``True``, performs bounded continuous Brent refinement via
+            ``scipy.optimize.minimize_scalar`` using Pareto AIC/BIC model selection to
+            pinpoint ``order_`` to ``~1e-3`` precision. Defaults to ``self.optimize_order``.
+        order_bounds : tuple of (float, float) or None, default=None
+            Search interval ``(alpha_min, alpha_max)`` when ``optimize_order=True``.
+            Defaults to ``self.order_bounds`` ``(0.1, 1.0)``.
+        criterion : {"bic", "aic"} or None, default=None
+            Pareto information criterion minimized during continuous order optimization.
+            Defaults to ``self.criterion`` (``"bic"``).
+        dx : float or sequence of float/1D arrays or None, default=None
+            Optional spatial grid spacing(s) for N-D PDE data.
         X_clean : np.ndarray or None, default=None
-            Optional noise-free reference trajectory used solely for oracle benchmark
-            scoring on the validation split (defaults to ``None`` for deployment-realistic
-            noisy validation).
+            Optional noise-free reference trajectory for oracle benchmark validation.
         true_order : float or None, default=None
             Optional true fractional order used with ``X_clean`` for oracle scoring.
         input_features : sequence of str or None, default=None
-            Optional variable names (e.g. ``["x", "y"]`` or ``["p", "c", "n"]``).
-
-        Returns
-        -------
-        self : WeakSINDy
-            Fitted estimator.
+            Optional variable names (e.g. ``["x", "y", "z"]`` or ``["p", "c", "n"]``).
         """
         X_arr = np.asarray(X, dtype=np.float64)
         if X_arr.ndim == 1:
             X_arr = X_arr[:, np.newaxis]
-        if X_arr.ndim not in (2, 3):
-            raise ValueError(f"Expected X to be 2D or 3D; got shape {X_arr.shape}.")
+        if X_arr.ndim < 2:
+            raise ValueError(f"Expected X to have at least 2 dimensions; got shape {X_arr.shape}.")
 
         nt = X_arr.shape[0]
         dt = extract_time_step(t)
@@ -475,40 +665,185 @@ class WeakSINDy(BaseEstimator):
                 f"Length of time vector t ({np.asarray(t).size}) must match X.shape[0] ({nt})."
             )
 
+        do_optimize = self.optimize_order if optimize_order is None else bool(optimize_order)
+        bounds = self.order_bounds if order_bounds is None else (float(order_bounds[0]), float(order_bounds[1]))
+        sel_criterion = self.criterion if criterion is None else criterion
+        if sel_criterion not in ("bic", "aic"):
+            raise ValueError(f"criterion must be 'bic' or 'aic'; got {sel_criterion!r}.")
+
         raw_orders = self.orders if orders is None else orders
         if np.ndim(raw_orders) == 0:
             cand_orders = [float(raw_orders)]  # type: ignore[arg-type]
         else:
             cand_orders = [float(a) for a in raw_orders]  # type: ignore[union-attr]
-        if len(cand_orders) == 0:
+        if not do_optimize and len(cand_orders) == 0:
             raise ValueError("Candidate orders list must be non-empty.")
 
         eff_k_start = min(int(self.k_start), max(0, nt // 4))
 
         lib = self._make_library(X_arr, dx=dx)
         lib.fit(X_arr)
-        Theta_full = lib.transform(X_arr)
 
+        X_val_src = X_arr
         if X_clean is not None:
             X_val_src = np.asarray(X_clean, dtype=np.float64)
             if X_val_src.ndim == 1:
                 X_val_src = X_val_src[:, np.newaxis]
-            Theta_val_src = lib.transform(X_val_src)
-        else:
-            X_val_src = X_arr
-            Theta_val_src = Theta_full
 
         order_scores: dict[float, float] = {}
+        profile_records: dict[float, dict[str, float | int]] = {}
 
-        if len(cand_orders) == 1:
-            best_order = cand_orders[0]
-            X_design, Y_target = self._assemble_system(
-                X_arr, Theta_full, dt=dt, alpha=best_order, k_start=eff_k_start, k_end=nt
+        if do_optimize:
+            a_min, a_max = float(bounds[0]), float(bounds[1])
+            if not (np.isfinite(a_min) and np.isfinite(a_max) and 0.0 < a_min < a_max):
+                raise ValueError(
+                    f"order_bounds must satisfy 0 < alpha_min < alpha_max; got {bounds}."
+                )
+
+            full_cache = self._build_cache(
+                X_arr, lib=lib, dt=dt, k_start=eff_k_start, k_end=nt, dx=dx
             )
-            opt = self._make_optimizer().fit(X_design, Y_target)
-            y_pred = opt.predict(X_design)
+
+            n_sub = full_cache.X_design.shape[0]
+            n_vars_tot = X_arr.shape[-1]
+            state_vars = np.array(
+                [max(float(np.var(X_arr[..., d])), 1e-12) for d in range(n_vars_tot)],
+                dtype=np.float64,
+            )
+            n_indep = max(4.0, (n_sub / max(1.0, full_cache.overlap_factor)) * n_vars_tot)
+
+            oracle_val_cache: _ProjectedSystemCache | None = None
+            oracle_tr_cache: _ProjectedSystemCache | None = None
+            if X_clean is not None and true_order is not None:
+                nt_train = int((1.0 - float(self.val_split)) * nt)
+                oracle_tr_cache = self._build_cache(
+                    X_arr, lib=lib, dt=dt, k_start=eff_k_start, k_end=nt_train, dx=dx
+                )
+                oracle_val_cache = self._build_cache(
+                    X_val_src, lib=lib, dt=dt, k_start=nt_train, k_end=nt, dx=dx
+                )
+                Y_oracle_val, oracle_gain = oracle_val_cache.target_and_gain(float(true_order))
+
+            def evaluate_alpha(alpha_val: float) -> float:
+                key = round(float(alpha_val), 6)
+                if key in profile_records:
+                    return float(profile_records[key][sel_criterion])
+
+                if oracle_tr_cache is not None and oracle_val_cache is not None:
+                    Y_tr_o = oracle_tr_cache.target(key)
+                    opt_o = self._make_optimizer().fit(oracle_tr_cache.X_design, Y_tr_o)
+                    Y_pred_o = opt_o.predict(oracle_val_cache.X_design)
+                    r2_v = _mean_r2_score(Y_oracle_val, Y_pred_o)
+                    n_act = int(np.sum(opt_o.coef_ != 0.0))
+                    aic_v, bic_v = _compute_aic_bic(
+                        Y_oracle_val,
+                        Y_pred_o,
+                        n_act,
+                        noise_gain=oracle_gain,
+                        state_vars=state_vars,
+                        n_indep=n_indep,
+                    )
+                else:
+                    Y_all, g_alpha = full_cache.target_and_gain(key)
+                    X_all = full_cache.X_design
+                    opt_full = self._make_optimizer().fit(X_all, Y_all)
+                    n_act = int(np.sum(opt_full.coef_ != 0.0))
+                    Y_hat = opt_full.predict(X_all)
+                    r2_v = _mean_r2_score(Y_all, Y_hat)
+                    if n_act == 0:
+                        aic_v, bic_v = 1e12, 1e12
+                    else:
+                        aic_v, bic_v = _compute_aic_bic(
+                            Y_all,
+                            Y_hat,
+                            n_act,
+                            noise_gain=g_alpha,
+                            state_vars=state_vars,
+                            n_indep=n_indep,
+                        )
+
+                order_scores[key] = r2_v
+                profile_records[key] = {
+                    "r2": r2_v,
+                    "aic": aic_v,
+                    "bic": bic_v,
+                    "n_active": n_act,
+                }
+                return float(bic_v if sel_criterion == "bic" else aic_v)
+
+            # 1. Global coarse bracket scan across [a_min, a_max] + user candidate orders in bounds
+            coarse_grid = list(np.linspace(a_min, a_max, 25))
+            if orders is not None:
+                coarse_grid.extend(a for a in cand_orders if a_min <= a <= a_max)
+            coarse_unique = sorted({round(float(a), 6) for a in coarse_grid})
+            coarse_vals = [evaluate_alpha(a) for a in coarse_unique]
+
+            seed_indices = {int(np.argmin(coarse_vals))}
+            positive_acts = [
+                int(profile_records[a]["n_active"])
+                for a in coarse_unique
+                if int(profile_records[a]["n_active"]) > 0
+            ]
+            if positive_acts:
+                min_act = min(positive_acts)
+                sparse_idxs = [
+                    idx
+                    for idx, a in enumerate(coarse_unique)
+                    if int(profile_records[a]["n_active"]) == min_act
+                ]
+                seed_indices.add(min(sparse_idxs, key=lambda idx: coarse_vals[idx]))
+
+            # 2. Continuous golden-section / Brent refinement to < 1e-3 precision
+            h_step = (a_max - a_min) / 24.0
+            for s_idx in sorted(seed_indices):
+                a_seed = coarse_unique[s_idx]
+                b_lo = max(a_min, a_seed - 1.5 * h_step)
+                b_hi = min(a_max, a_seed + 1.5 * h_step)
+                res = minimize_scalar(
+                    evaluate_alpha,
+                    bounds=(b_lo, b_hi),
+                    method="bounded",
+                    options={"xatol": 1e-4, "maxiter": 50},
+                )
+                _ = evaluate_alpha(float(res.x))
+
+            # Select overall optimum across all bracket + Brent points (including exact endpoints)
+            best_order = min(
+                profile_records.keys(),
+                key=lambda k: (float(profile_records[k][sel_criterion]), -float(profile_records[k]["r2"])),
+            )
+
+            Y_final, g_final = full_cache.target_and_gain(best_order)
+            opt = self._make_optimizer().fit(full_cache.X_design, Y_final)
+            Y_final_pred = opt.predict(full_cache.X_design)
+            best_r2 = float(profile_records[best_order]["r2"])
+            final_aic, final_bic = _compute_aic_bic(
+                Y_final,
+                Y_final_pred,
+                int(np.sum(opt.coef_ != 0.0)),
+                noise_gain=g_final,
+                state_vars=state_vars,
+                n_indep=n_indep,
+            )
+
+        elif len(cand_orders) == 1:
+            best_order = cand_orders[0]
+            full_cache = self._build_cache(
+                X_arr, lib=lib, dt=dt, k_start=eff_k_start, k_end=nt, dx=dx
+            )
+            Y_target = full_cache.target(best_order)
+            opt = self._make_optimizer().fit(full_cache.X_design, Y_target)
+            y_pred = opt.predict(full_cache.X_design)
             best_r2 = _mean_r2_score(Y_target, y_pred)
+            n_act = int(np.sum(opt.coef_ != 0.0))
+            final_aic, final_bic = _compute_aic_bic(Y_target, y_pred, n_act)
             order_scores[best_order] = best_r2
+            profile_records[best_order] = {
+                "r2": best_r2,
+                "aic": final_aic,
+                "bic": final_bic,
+                "n_active": n_act,
+            }
         else:
             nt_train = int((1.0 - float(self.val_split)) * nt)
             if nt_train - eff_k_start < 8 or nt - nt_train < 6:
@@ -517,68 +852,81 @@ class WeakSINDy(BaseEstimator):
                     f"(k_start={eff_k_start}, val_split={self.val_split})."
                 )
 
+            tr_cache = self._build_cache(
+                X_arr, lib=lib, dt=dt, k_start=eff_k_start, k_end=nt_train, dx=dx
+            )
+            val_cache = self._build_cache(
+                X_val_src, lib=lib, dt=dt, k_start=nt_train, k_end=nt, dx=dx
+            )
+
             best_order = cand_orders[0]
             best_r2 = -np.inf
             best_opt: STLSQ | SR3 | None = None
 
             for alpha in cand_orders:
-                X_tr, Y_tr = self._assemble_system(
-                    X_arr, Theta_full, dt=dt, alpha=alpha, k_start=eff_k_start, k_end=nt_train
+                Y_tr = tr_cache.target(alpha)
+                val_alpha = (
+                    float(true_order) if (X_clean is not None and true_order is not None) else alpha
                 )
-                val_alpha = float(true_order) if (X_clean is not None and true_order is not None) else alpha
-                X_val, Y_val = self._assemble_system(
-                    X_val_src,
-                    Theta_val_src,
-                    dt=dt,
-                    alpha=val_alpha,
-                    k_start=nt_train,
-                    k_end=nt,
-                )
-                opt_cand = self._make_optimizer().fit(X_tr, Y_tr)
-                Y_pred = opt_cand.predict(X_val)
+                Y_val = val_cache.target(val_alpha)
+                opt_cand = self._make_optimizer().fit(tr_cache.X_design, Y_tr)
+                Y_pred = opt_cand.predict(val_cache.X_design)
                 r2 = _mean_r2_score(Y_val, Y_pred)
+                n_act = int(np.sum(opt_cand.coef_ != 0.0))
+                aic_val, bic_val = _compute_aic_bic(Y_val, Y_pred, n_act)
                 order_scores[alpha] = r2
+                profile_records[alpha] = {
+                    "r2": r2,
+                    "aic": aic_val,
+                    "bic": bic_val,
+                    "n_active": n_act,
+                }
                 if r2 > best_r2:
                     best_r2 = r2
                     best_order = alpha
                     best_opt = opt_cand
 
             if self.refit or best_opt is None:
-                X_full_design, Y_full_target = self._assemble_system(
-                    X_arr, Theta_full, dt=dt, alpha=best_order, k_start=eff_k_start, k_end=nt
+                full_cache = self._build_cache(
+                    X_arr, lib=lib, dt=dt, k_start=eff_k_start, k_end=nt, dx=dx
                 )
-                opt = self._make_optimizer().fit(X_full_design, Y_full_target)
+                Y_full = full_cache.target(best_order)
+                opt = self._make_optimizer().fit(full_cache.X_design, Y_full)
+                Y_full_pred = opt.predict(full_cache.X_design)
+                final_aic, final_bic = _compute_aic_bic(
+                    Y_full, Y_full_pred, int(np.sum(opt.coef_ != 0.0))
+                )
             else:
                 opt = best_opt
+                final_aic = float(profile_records[best_order]["aic"])
+                final_bic = float(profile_records[best_order]["bic"])
+
+        sorted_alphas = sorted(profile_records.keys())
+        self.order_profile_ = {
+            "orders": [float(a) for a in sorted_alphas],
+            "r2": [float(profile_records[a]["r2"]) for a in sorted_alphas],
+            "aic": [float(profile_records[a]["aic"]) for a in sorted_alphas],
+            "bic": [float(profile_records[a]["bic"]) for a in sorted_alphas],
+            "n_active": [int(profile_records[a]["n_active"]) for a in sorted_alphas],
+        }
 
         self.dt_ = dt
+        self.dx_ = dx if dx is not None else self.dx
         self.library_ = lib
         self.optimizer_ = opt
         self.coef_ = opt.coef_
         self.order_ = float(best_order)
         self.order_scores_ = order_scores
         self.r2_score_ = float(best_r2)
+        self.aic_ = float(final_aic)
+        self.bic_ = float(final_bic)
         self.n_features_in_ = X_arr.shape[-1]
         self.input_features_ = lib._default_feature_names(self.n_features_in_, input_features)
         self.feature_names_ = lib.get_feature_names(self.input_features_)
         return self
 
     def predict(self, t: float | np.ndarray, X: np.ndarray | None = None) -> np.ndarray:
-        """Predict fractional time derivatives ``D_t^(order_) X = Theta(X) @ coef_.T``.
-
-        Parameters
-        ----------
-        t : float or np.ndarray
-            Time coordinate vector ``t`` or step ``dt`` (or state array ``X`` if called
-            with a single argument).
-        X : np.ndarray or None, default=None
-            State array of shape ``(nt, n_vars)`` or ``(nt, nx, n_vars)``.
-
-        Returns
-        -------
-        dX_pred : np.ndarray
-            Predicted fractional derivatives matching the shape of ``X``.
-        """
+        """Predict fractional time derivatives ``D_t^(order_) X = Theta(X) @ coef_.T``."""
         if not hasattr(self, "coef_"):
             raise RuntimeError("WeakSINDy must be fitted before calling predict.")
 
@@ -618,12 +966,12 @@ class WeakSINDy(BaseEstimator):
             yp = self.predict(dt, X_arr).reshape(-1, self.coef_.shape[0])
             return _mean_r2_score(yt, yp)
 
-        Theta = self.library_.transform(X_arr)
         eff_k = min(int(self.k_start), max(0, X_arr.shape[0] // 4))
-        X_des, Y_tar = self._assemble_system(
-            X_arr, Theta, dt=dt, alpha=self.order_, k_start=eff_k, k_end=X_arr.shape[0]
+        cache = self._build_cache(
+            X_arr, lib=self.library_, dt=dt, k_start=eff_k, k_end=X_arr.shape[0], dx=self.dx_
         )
-        return _mean_r2_score(Y_tar, X_des @ self.coef_.T)
+        Y_tar = cache.target(self.order_)
+        return _mean_r2_score(Y_tar, cache.X_design @ self.coef_.T)
 
     def equations(
         self,
@@ -640,11 +988,13 @@ class WeakSINDy(BaseEstimator):
         )
         feat_names = self.library_.get_feature_names(state_names)
 
-        lhs_op = (
-            "d/dt"
-            if np.isclose(self.order_, 1.0)
-            else f"D_t^{self.order_:.2f}"
-        )
+        if np.isclose(self.order_, 1.0, atol=5e-4):
+            lhs_op = "d/dt"
+        elif abs(round(self.order_, 2) - round(self.order_, 3)) < 1e-6:
+            lhs_op = f"D_t^{self.order_:.2f}"
+        else:
+            lhs_op = f"D_t^{self.order_:.3f}"
+
         eqs: list[str] = []
         for d, s_name in enumerate(state_names):
             terms: list[str] = []
